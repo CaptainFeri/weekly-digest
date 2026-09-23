@@ -3,9 +3,7 @@ name: Weekly GitHub Digest
 on:
   schedule:
     # هر چهارشنبه ساعت 18:00 UTC (21:30 به وقت تهران)
-    # cron format: minute hour day-of-month month day-of-week
-    # day-of-week: 0=Sunday, 1=Monday, ..., 3=Wednesday, 6=Saturday
-    - cron: "0 10 * * 3"
+    - cron: "0 18 * * 3"
 
   # اجازه اجرای دستی برای تست
   workflow_dispatch:
@@ -14,7 +12,7 @@ jobs:
   build-digest:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # برای کامیت کردن خلاصه در مخزن
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -30,11 +28,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests python-dateutil
 
+      - name: Debug token presence
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "❌ GH_TOKEN is empty! Add GH_PAT to repository secrets."
+            exit 1
+          else
+            echo "✅ GH_TOKEN is set (length: ${#GH_TOKEN})"
+          fi
+
       - name: Generate weekly digest
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           GH_USERNAME: ${{ github.repository_owner }}
-          # اختیاری: برای خلاصه‌سازی با AI
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python scripts/digest.py
 
