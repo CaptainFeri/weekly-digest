@@ -23,7 +23,6 @@ HEADERS = {
 }
 
 REST_URL = "https://api.github.com"
-GRAPHQL_URL = "https://api.github.com/graphql"
 
 
 # ---------- اعتبارسنجی ----------
@@ -43,11 +42,11 @@ def get_week_range():
     return start, end
 
 
-# ---------- لیست همه مخازن ----------
-def list_all_repos():
+# ---------- لیست مخازن شما (owner) ----------
+def list_owned_repos():
     """
-    همه مخازنی که کاربر مالک یا collaborator است را برمی‌گرداند.
-    شامل: owner, collaborator, organization member
+    فقط مخازنی که شما owner آن‌ها هستید (نه fork ها).
+    شامل مخازن شخصی و سازمانی که owner هستید.
     """
     repos = []
     page = 1
@@ -57,7 +56,7 @@ def list_all_repos():
             "per_page": 100,
             "page": page,
             "sort": "pushed",
-            "affiliation": "owner,collaborator,organization_member",
+            "affiliation": "owner",   # ← فقط owner (نه collaborator)
         }
         r = requests.get(url, headers=HEADERS, params=params, timeout=30)
         r.raise_for_status()
@@ -69,15 +68,17 @@ def list_all_repos():
             break
         page += 1
 
-    print(f"📦 Found {len(repos)} accessible repositories")
+    print(f"📦 Found {len(repos)} owned repositories")
     return repos
 
 
-# ---------- کامیت‌های هر مخزن ----------
-def fetch_commits_for_repo(repo_full_name, start, end, author):
+# ---------- همه کامیت‌های یک مخزن (بدون فیلتر author) ----------
+def fetch_all_commits_for_repo(repo_full_name, start, end):
+    """
+    همه کامیت‌های مخزن در بازه مشخص، از هر author ی.
+    """
     url = f"{REST_URL}/repos/{repo_full_name}/commits"
     params = {
-        "author": author,
         "since": start.isoformat(),
         "until": end.isoformat(),
         "per_page": 100,
@@ -89,10 +90,10 @@ def fetch_commits_for_repo(repo_full_name, start, end, author):
     if r.status_code == 404:
         return []
     if r.status_code == 403:
-        print(f"⚠️  {repo_full_name}: rate limit")
+        print(f"⚠️  {repo_full_name}: rate limit or forbidden")
         return []
     if r.status_code == 422:
-        print(f"⚠️  {repo_full_name}: invalid request (empty repo?)")
+        print(f"⚠️  {repo_full_name}: empty repository")
         return []
     r.raise_for_status()
 
@@ -101,33 +102,47 @@ def fetch_commits_for_repo(repo_full_name, start, end, author):
         message = c["commit"]["message"].split("\n")[0].strip()
         if not message:
             continue
+
+        # author می‌تواند None باشد (کامیت با ایمیل نامعتبر)
+        author_login = c.get("author", {}).get("login") if c.get("author") else None
+        author_name = c["commit"]["author"]["name"]
+        author_email = c["commit"]["author"]["email"]
+
         commits.append({
             "sha": c["sha"][:7],
             "message": message,
             "url": c["html_url"],
             "date": c["commit"]["author"]["date"],
             "repo": repo_full_name,
+            "author_login": author_login,      # ممکن است None باشد
+            "author_name": author_name,
+            "author_email": author_email,
+            "is_self": (
+                author_login == USERNAME
+                or author_email == f"{USERNAME}@users.noreply.github.com"
+            ),
         })
     return commits
 
 
 def collect_all_commits(repos, start, end):
-    """از همه مخازن کامیت‌های بازه را جمع می‌کند."""
+    """از همه مخازن شما، همه کامیت‌های بازه را جمع می‌کند."""
     all_commits = []
     for i, repo in enumerate(repos, 1):
         full_name = repo["full_name"]
-        # فقط مخازنی که در بازه به‌روزرسانی شده‌اند را چک کن (بهینه‌سازی)
+
+        # بهینه‌سازی: اگر مخزن در بازه push نشده، رد کن
         pushed_at = repo.get("pushed_at")
         if pushed_at:
             try:
                 pushed_dt = datetime.fromisoformat(pushed_at.replace("Z", "+00:00"))
                 if pushed_dt < start:
-                    continue  # این مخزن در بازه تغییر نکرده
+                    continue
             except Exception:
                 pass
 
         print(f"  [{i}/{len(repos)}] 📥 {full_name}")
-        commits = fetch_commits_for_repo(full_name, start, end, USERNAME)
+        commits = fetch_all_commits_for_repo(full_name, start, end)
         for c in commits:
             c["is_private"] = repo["private"]
         all_commits.extend(commits)
@@ -135,115 +150,35 @@ def collect_all_commits(repos, start, end):
     return all_commits
 
 
-# ---------- PR و Issue ها با GraphQL ----------
-GRAPHQL_QUERY = """
-query($username: String!, $from: DateTime!, $to: DateTime!) {
-  user(login: $username) {
-    contributionsCollection(from: $from, to: $to) {
-      totalCommitContributions
-      totalPullRequestContributions
-      totalIssueContributions
-      restrictedContributionsCount
-      pullRequestContributions(first: 100) {
-        nodes {
-          pullRequest {
-            title
-            url
-            state
-            createdAt
-            repository { nameWithOwner }
-          }
-        }
-      }
-      issueContributions(first: 100) {
-        nodes {
-          issue {
-            title
-            url
-            state
-            createdAt
-            repository { nameWithOwner }
-          }
-        }
-      }
-    }
-  }
-}
-"""
-
-
-def fetch_prs_and_issues(start, end):
-    variables = {
-        "username": USERNAME,
-        "from": start.isoformat(),
-        "to": end.isoformat(),
-    }
-    r = requests.post(
-        GRAPHQL_URL,
-        headers=HEADERS,
-        json={"query": GRAPHQL_QUERY, "variables": variables},
-        timeout=30,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if "errors" in data:
-        print(f"⚠️  GraphQL errors: {data['errors']}")
-        return [], [], {}
-
-    cc = data["data"]["user"]["contributionsCollection"]
-
-    prs = []
-    for node in cc["pullRequestContributions"]["nodes"]:
-        pr = node["pullRequest"]
-        prs.append({
-            "title": pr["title"],
-            "url": pr["url"],
-            "state": pr["state"],
-            "repo": pr["repository"]["nameWithOwner"],
-        })
-
-    issues = []
-    for node in cc["issueContributions"]["nodes"]:
-        issue = node["issue"]
-        issues.append({
-            "title": issue["title"],
-            "url": issue["url"],
-            "state": issue["state"],
-            "repo": issue["repository"]["nameWithOwner"],
-        })
-
-    stats = {
-        "total_commits": cc["totalCommitContributions"],
-        "total_prs": cc["totalPullRequestContributions"],
-        "total_issues": cc["totalIssueContributions"],
-        "restricted": cc["restrictedContributionsCount"],
-    }
-
-    return prs, issues, stats
-
-
 # ---------- خلاصه‌سازی با AI ----------
-def summarize_with_ai(prs, issues, all_commits, stats):
+def summarize_with_ai(all_commits, stats_by_author):
     if not OPENAI_API_KEY:
         return None
 
     raw = {
-        "stats": stats,
-        "pull_requests": [{"title": p["title"], "repo": p["repo"]} for p in prs],
-        "issues": [{"title": i["title"], "repo": i["repo"]} for i in issues],
+        "total_commits": len(all_commits),
+        "by_author": stats_by_author,
         "commits": [
-            {"repo": c["repo"], "message": c["message"]}
-            for c in all_commits[:100]
+            {
+                "repo": c["repo"],
+                "author": c["author_login"] or c["author_name"],
+                "message": c["message"],
+                "is_self": c["is_self"],
+            }
+            for c in all_commits[:120]
         ],
     }
 
     prompt = (
-        "تو یک دستیار هستی که خلاصه هفتگی فعالیت‌های گیت‌هاب یک توسعه‌دهنده را "
-        "به فارسی، خوانا و مختصر می‌نویسد.\n\n"
+        "تو یک دستیار هستی که خلاصه هفتگی فعالیت‌های گیت‌هاب را به فارسی، "
+        "خوانا و مختصر می‌نویسد.\n\n"
+        "این خلاصه دربارهٔ **همه کامیت‌های روی مخازن یک کاربر** است، "
+        "شامل کامیت‌های خودش و همکارانش.\n\n"
         "بر اساس داده‌های JSON زیر، یک خلاصه ۳ تا ۵ پاراگرافی بنویس که:\n"
         "۱. روی چه موضوعاتی کار شده (بر اساس پیام کامیت‌ها)\n"
         "۲. چه پروژه‌هایی فعال بوده‌اند\n"
-        "۳. اگر الگوی مشخصی هست (رفع باگ، فیچر، رفکتور) اشاره کن\n"
+        "۳. چه کسانی مشارکت داشته‌اند (خود کاربر vs دیگران)\n"
+        "۴. اگر الگوی مشخصی هست (رفع باگ، فیچر، رفکتور) اشاره کن\n"
         "اگر عددی صفر بود، به آن اشاره نکن.\n\n"
         f"{json.dumps(raw, ensure_ascii=False, indent=2)}"
     )
@@ -265,20 +200,36 @@ def summarize_with_ai(prs, issues, all_commits, stats):
     return r.json()["choices"][0]["message"]["content"]
 
 
+# ---------- آمار ----------
+def compute_stats(all_commits):
+    """آمار کلی بر اساس author و repo."""
+    by_author = {}
+    by_repo = {}
+    for c in all_commits:
+        author = c["author_login"] or c["author_name"]
+        by_author[author] = by_author.get(author, 0) + 1
+
+        repo = c["repo"]
+        if repo not in by_repo:
+            by_repo[repo] = {"total": 0, "by_author": {}}
+        by_repo[repo]["total"] += 1
+        by_repo[repo]["by_author"][author] = \
+            by_repo[repo]["by_author"].get(author, 0) + 1
+
+    return by_author, by_repo
+
+
 # ---------- Markdown ----------
-def build_markdown(start, end, prs, issues, all_commits, stats, ai_summary):
+def build_markdown(start, end, all_commits, by_author, by_repo, ai_summary):
     lines = []
-    lines.append("# 📊 خلاصه فعالیت هفتگی")
+    lines.append("# 📊 خلاصه فعالیت هفتگی مخازن")
     lines.append("")
     lines.append(
         f"**بازه:** {start.strftime('%Y-%m-%d')} (شنبه) → "
         f"{end.strftime('%Y-%m-%d')} (چهارشنبه)"
     )
     lines.append("")
-    lines.append(
-        f"**آمار کلی:** {len(all_commits)} کامیت · "
-        f"{len(prs)} PR · {len(issues)} Issue"
-    )
+    lines.append(f"**مجموع کامیت‌ها:** {len(all_commits)}")
     lines.append("")
 
     if ai_summary:
@@ -287,41 +238,41 @@ def build_markdown(start, end, prs, issues, all_commits, stats, ai_summary):
         lines.append(ai_summary)
         lines.append("")
 
-    if all_commits:
-        lines.append("## 💻 کامیت‌ها")
+    # آمار مشارکت‌کنندگان
+    if by_author:
+        lines.append("## 👥 مشارکت‌کنندگان")
+        lines.append("")
+        for author, count in sorted(by_author.items(), key=lambda x: x[1], reverse=True):
+            marker = "👤 (شما)" if author == USERNAME else ""
+            lines.append(f"- **{author}** {marker} — {count} کامیت")
         lines.append("")
 
-        by_repo = {}
-        for c in all_commits:
-            by_repo.setdefault(c["repo"], []).append(c)
+    # کامیت‌ها به تفکیک مخزن
+    if all_commits:
+        lines.append("## 💻 کامیت‌ها به تفکیک مخزن")
+        lines.append("")
 
-        # مرتب‌سازی مخازن بر اساس تعداد کامیت
-        for repo_name in sorted(by_repo, key=lambda r: len(by_repo[r]), reverse=True):
-            commits = by_repo[repo_name]
+        for repo_name in sorted(by_repo, key=lambda r: by_repo[r]["total"], reverse=True):
+            repo_data = by_repo[repo_name]
+            commits = [c for c in all_commits if c["repo"] == repo_name]
             is_private = commits[0].get("is_private", False)
             lock = "🔒" if is_private else "🌐"
-            lines.append(f"### {lock} {repo_name} ({len(commits)} کامیت)")
+
+            lines.append(f"### {lock} {repo_name} ({repo_data['total']} کامیت)")
             lines.append("")
+
+            # گروه‌بندی بر اساس author
             for c in commits:
-                lines.append(f"- [`{c['sha']}`]({c['url']}) {c['message']}")
+                author = c["author_login"] or c["author_name"]
+                marker = "" if c["is_self"] else " 👥"
+                lines.append(
+                    f"- [`{c['sha']}`]({c['url']}) {c['message']} "
+                    f"— _{author}_{marker}"
+                )
             lines.append("")
 
-    if prs:
-        lines.append("## 🔀 Pull Requests")
-        for p in prs:
-            icon = "✅" if p["state"] == "MERGED" else ("🟣" if p["state"] == "CLOSED" else "🟢")
-            lines.append(f"- {icon} [{p['title']}]({p['url']}) — _{p['repo']}_")
-        lines.append("")
-
-    if issues:
-        lines.append("## 🐛 Issues")
-        for i in issues:
-            icon = "✅" if i["state"] == "CLOSED" else "🟢"
-            lines.append(f"- {icon} [{i['title']}]({i['url']}) — _{i['repo']}_")
-        lines.append("")
-
-    if not (all_commits or prs or issues):
-        lines.append("> 🎉 این هفته هیچ فعالیتی ثبت نشده بود.")
+    if not all_commits:
+        lines.append("> 🎉 این هفته هیچ کامیتی روی مخازن شما ثبت نشده بود.")
         lines.append("")
 
     lines.append("---")
@@ -337,20 +288,20 @@ def main():
     start, end = get_week_range()
     print(f"📅 بازه: {start} → {end}")
 
-    repos = list_all_repos()
+    repos = list_owned_repos()
     all_commits = collect_all_commits(repos, start, end)
     print(f"💻 Total commits found: {len(all_commits)}")
 
-    prs, issues, stats = fetch_prs_and_issues(start, end)
-    print(f"🔀 PRs: {len(prs)}, 🐛 Issues: {len(issues)}")
+    by_author, by_repo = compute_stats(all_commits)
+    print(f"👥 Authors: {len(by_author)}, 📦 Active repos: {len(by_repo)}")
 
     ai_summary = None
     try:
-        ai_summary = summarize_with_ai(prs, issues, all_commits, stats)
+        ai_summary = summarize_with_ai(all_commits, by_author)
     except Exception as e:
         print(f"⚠️  AI summarization failed: {e}")
 
-    md = build_markdown(start, end, prs, issues, all_commits, stats, ai_summary)
+    md = build_markdown(start, end, all_commits, by_author, by_repo, ai_summary)
 
     out_dir = Path("digests")
     out_dir.mkdir(exist_ok=True)
