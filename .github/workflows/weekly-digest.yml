@@ -5,7 +5,7 @@ on:
     # هر چهارشنبه ساعت 18:00 UTC (21:30 به وقت تهران)
     # cron format: minute hour day-of-month month day-of-week
     # day-of-week: 0=Sunday, 1=Monday, ..., 3=Wednesday, 6=Saturday
-    - cron: "0 18 * * 3"
+    - cron: "0 10 * * 3"
 
   # اجازه اجرای دستی برای تست
   workflow_dispatch:
