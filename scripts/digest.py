@@ -23,11 +23,12 @@ HEADERS = {
 }
 
 GRAPHQL_URL = "https://api.github.com/graphql"
+REST_URL = "https://api.github.com"
 
 
 # ---------- اعتبارسنجی ----------
 def check_auth():
-    r = requests.get("https://api.github.com/user", headers=HEADERS, timeout=15)
+    r = requests.get(f"{REST_URL}/user", headers=HEADERS, timeout=15)
     if r.status_code == 401:
         sys.exit("❌ 401 Unauthorized — توکن نامعتبر است یا اسکوپ کافی ندارد.")
     r.raise_for_status()
@@ -38,14 +39,13 @@ def check_auth():
 
 # ---------- بازه زمانی ----------
 def get_week_range():
-    """بازه شنبه تا چهارشنبه."""
     now = datetime.now(timezone.utc)
     end = now.replace(hour=23, minute=59, second=59, microsecond=0)
     start = (end - timedelta(days=4)).replace(hour=0, minute=0, second=0, microsecond=0)
     return start, end
 
 
-# ---------- GraphQL ----------
+# ---------- GraphQL: خلاصه مشارکت‌ها ----------
 GRAPHQL_QUERY = """
 query($username: String!, $from: DateTime!, $to: DateTime!) {
   user(login: $username) {
@@ -59,6 +59,7 @@ query($username: String!, $from: DateTime!, $to: DateTime!) {
           nameWithOwner
           url
           isPrivate
+          defaultBranchRef { name }
         }
         contributions(first: 100) {
           nodes {
@@ -74,9 +75,7 @@ query($username: String!, $from: DateTime!, $to: DateTime!) {
             url
             state
             createdAt
-            repository {
-              nameWithOwner
-            }
+            repository { nameWithOwner }
           }
         }
       }
@@ -87,9 +86,7 @@ query($username: String!, $from: DateTime!, $to: DateTime!) {
             url
             state
             createdAt
-            repository {
-              nameWithOwner
-            }
+            repository { nameWithOwner }
           }
         }
       }
@@ -100,7 +97,6 @@ query($username: String!, $from: DateTime!, $to: DateTime!) {
 
 
 def fetch_contributions(start, end):
-    """همه فعالیت‌ها را از GraphQL دریافت می‌کند (شامل مخازن خصوصی)."""
     variables = {
         "username": USERNAME,
         "from": start.isoformat(),
@@ -112,21 +108,59 @@ def fetch_contributions(start, end):
         json={"query": GRAPHQL_QUERY, "variables": variables},
         timeout=30,
     )
-
     if r.status_code == 401:
         sys.exit("❌ 401 on GraphQL — توکن اجازه دسترسی ندارد.")
     r.raise_for_status()
-
     data = r.json()
     if "errors" in data:
         print(f"⚠️  GraphQL errors: {data['errors']}")
         sys.exit(1)
-
     return data["data"]["user"]["contributionsCollection"]
 
 
-def parse_contributions(cc):
-    """داده‌های GraphQL را به ساختار ساده تبدیل می‌کند."""
+# ---------- REST: پیام کامیت‌ها ----------
+def fetch_commits_for_repo(repo_full_name: str, start: datetime, end: datetime, author: str):
+    """
+    کامیت‌های یک مخزن توسط یک author در بازه مشخص.
+    repo_full_name مثال: "CaptainFeri/weekly-digest"
+    """
+    url = f"{REST_URL}/repos/{repo_full_name}/commits"
+    params = {
+        "author": author,
+        "since": start.isoformat(),
+        "until": end.isoformat(),
+        "per_page": 100,
+    }
+    r = requests.get(url, headers=HEADERS, params=params, timeout=30)
+
+    # مخزن ممکن است خالی باشد یا دسترسی نباشد
+    if r.status_code == 409:
+        print(f"⚠️  {repo_full_name}: empty repository")
+        return []
+    if r.status_code == 404:
+        print(f"⚠️  {repo_full_name}: not found or no access")
+        return []
+    if r.status_code == 403:
+        print(f"⚠️  {repo_full_name}: rate limit or forbidden")
+        return []
+    r.raise_for_status()
+
+    commits = []
+    for c in r.json():
+        message = c["commit"]["message"].split("\n")[0].strip()
+        if not message:
+            continue
+        commits.append({
+            "sha": c["sha"][:7],
+            "message": message,
+            "url": c["html_url"],
+            "date": c["commit"]["author"]["date"],
+            "repo": repo_full_name,
+        })
+    return commits
+
+
+def parse_contributions(cc, start, end):
     # PRها
     prs = []
     for node in cc["pullRequestContributions"]["nodes"]:
@@ -151,24 +185,29 @@ def parse_contributions(cc):
             "date": issue["createdAt"],
         })
 
-    # کامیت‌ها (تجمیع‌شده بر اساس مخزن)
-    commits_by_repo = []
-    total_commits = 0
+    # کامیت‌ها: اول لیست مخازن را از GraphQL می‌گیریم
+    repos_with_commits = []
     for repo_node in cc["commitContributionsByRepository"]:
         repo = repo_node["repository"]
-        total = 0
-        for c in repo_node["contributions"]["nodes"]:
-            total += c["commitCount"]
-        total_commits += total
+        total = sum(c["commitCount"] for c in repo_node["contributions"]["nodes"])
         if total > 0:
-            commits_by_repo.append({
+            repos_with_commits.append({
                 "repo": repo["nameWithOwner"],
                 "url": repo["url"],
                 "is_private": repo["isPrivate"],
                 "count": total,
             })
 
-    commits_by_repo.sort(key=lambda x: x["count"], reverse=True)
+    repos_with_commits.sort(key=lambda x: x["count"], reverse=True)
+
+    # سپس برای هر مخزن، پیام کامیت‌ها را از REST می‌گیریم
+    all_commits = []
+    for r in repos_with_commits:
+        print(f"  📥 Fetching commits from {r['repo']} ...")
+        commits = fetch_commits_for_repo(r["repo"], start, end, USERNAME)
+        for c in commits:
+            c["is_private"] = r["is_private"]
+        all_commits.extend(commits)
 
     stats = {
         "total_commits": cc["totalCommitContributions"],
@@ -177,11 +216,11 @@ def parse_contributions(cc):
         "restricted": cc["restrictedContributionsCount"],
     }
 
-    return prs, issues, commits_by_repo, stats
+    return prs, issues, repos_with_commits, all_commits, stats
 
 
 # ---------- خلاصه‌سازی با AI ----------
-def summarize_with_ai(prs, issues, commits_by_repo, stats):
+def summarize_with_ai(prs, issues, repos_with_commits, all_commits, stats):
     if not OPENAI_API_KEY:
         return None
 
@@ -189,13 +228,20 @@ def summarize_with_ai(prs, issues, commits_by_repo, stats):
         "stats": stats,
         "pull_requests": [{"title": p["title"], "repo": p["repo"]} for p in prs],
         "issues": [{"title": i["title"], "repo": i["repo"]} for i in issues],
-        "commits_by_repo": commits_by_repo,
+        "commits": [
+            {"repo": c["repo"], "message": c["message"]}
+            for c in all_commits[:80]
+        ],
     }
 
     prompt = (
         "تو یک دستیار هستی که خلاصه هفتگی فعالیت‌های گیت‌هاب یک توسعه‌دهنده را "
-        "به فارسی، خوانا و مختصر می‌نویسد. داده‌های JSON زیر را به یک خلاصه "
-        "۳ تا ۵ پاراگرافی با تیترهای مشخص تبدیل کن. اگر عددی صفر بود، به آن اشاره نکن.\n\n"
+        "به فارسی، خوانا و مختصر می‌نویسد.\n\n"
+        "بر اساس داده‌های JSON زیر، یک خلاصه ۳ تا ۵ پاراگرافی بنویس که:\n"
+        "۱. روی چه موضوعاتی کار شده (بر اساس پیام کامیت‌ها)\n"
+        "۲. چه پروژه‌هایی فعال بوده‌اند\n"
+        "۳. اگر الگوی مشخصی هست (مثل رفع باگ، افزودن فیچر، رفکتور) اشاره کن\n"
+        "اگر عددی صفر بود، به آن اشاره نکن. لحن دوستانه و حرفه‌ای باشد.\n\n"
         f"{json.dumps(raw, ensure_ascii=False, indent=2)}"
     )
 
@@ -217,7 +263,7 @@ def summarize_with_ai(prs, issues, commits_by_repo, stats):
 
 
 # ---------- Markdown ----------
-def build_markdown(start, end, prs, issues, commits_by_repo, stats, ai_summary):
+def build_markdown(start, end, prs, issues, repos_with_commits, all_commits, stats, ai_summary):
     lines = []
     lines.append("# 📊 خلاصه فعالیت هفتگی")
     lines.append("")
@@ -240,12 +286,24 @@ def build_markdown(start, end, prs, issues, commits_by_repo, stats, ai_summary):
         lines.append(ai_summary)
         lines.append("")
 
-    if commits_by_repo:
-        lines.append("## 💻 کامیت‌ها بر اساس مخزن")
-        for c in commits_by_repo:
-            lock = "🔒" if c["is_private"] else "🌐"
-            lines.append(f"- {lock} **[{c['repo']}]({c['url']})** — {c['count']} کامیت")
+    # کامیت‌ها به تفکیک مخزن + پیام
+    if all_commits:
+        lines.append("## 💻 کامیت‌ها")
         lines.append("")
+
+        # گروه‌بندی بر اساس مخزن
+        by_repo = {}
+        for c in all_commits:
+            by_repo.setdefault(c["repo"], []).append(c)
+
+        for repo_name, commits in by_repo.items():
+            is_private = commits[0].get("is_private", False)
+            lock = "🔒" if is_private else "🌐"
+            lines.append(f"### {lock} {repo_name} ({len(commits)} کامیت)")
+            lines.append("")
+            for c in commits:
+                lines.append(f"- [`{c['sha']}`]({c['url']}) {c['message']}")
+            lines.append("")
 
     if prs:
         lines.append("## 🔀 Pull Requests")
@@ -261,7 +319,7 @@ def build_markdown(start, end, prs, issues, commits_by_repo, stats, ai_summary):
             lines.append(f"- {icon} [{i['title']}]({i['url']}) — _{i['repo']}_")
         lines.append("")
 
-    if not (commits_by_repo or prs or issues):
+    if not (all_commits or prs or issues):
         lines.append("> 🎉 این هفته هیچ فعالیتی ثبت نشده بود.")
         lines.append("")
 
@@ -279,18 +337,21 @@ def main():
     print(f"📅 بازه: {start} → {end}")
 
     cc = fetch_contributions(start, end)
-    prs, issues, commits_by_repo, stats = parse_contributions(cc)
+    prs, issues, repos_with_commits, all_commits, stats = parse_contributions(cc, start, end)
 
     print(f"📊 Stats: {stats}")
-    print(f"📦 Repos: {len(commits_by_repo)}, PRs: {len(prs)}, Issues: {len(issues)}")
+    print(f"📦 Repos: {len(repos_with_commits)}, Commits fetched: {len(all_commits)}, "
+          f"PRs: {len(prs)}, Issues: {len(issues)}")
 
     ai_summary = None
     try:
-        ai_summary = summarize_with_ai(prs, issues, commits_by_repo, stats)
+        ai_summary = summarize_with_ai(prs, issues, repos_with_commits, all_commits, stats)
     except Exception as e:
         print(f"⚠️  AI summarization failed: {e}")
 
-    md = build_markdown(start, end, prs, issues, commits_by_repo, stats, ai_summary)
+    md = build_markdown(
+        start, end, prs, issues, repos_with_commits, all_commits, stats, ai_summary
+    )
 
     out_dir = Path("digests")
     out_dir.mkdir(exist_ok=True)
